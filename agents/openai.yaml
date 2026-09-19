@@ -1,0 +1,7 @@
+interface:
+  display_name: "Podcast Chat"
+  short_description: "Ask podcasts questions with timestamped citations"
+  default_prompt: "Use $podcast-chat to answer my podcast question with evidence from the transcripts and timestamped citations."
+
+policy:
+  allow_implicit_invocation: true
