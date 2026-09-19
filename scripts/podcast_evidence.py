@@ -203,7 +203,7 @@ def cue_text(cue: Mapping[str, Any]) -> str:
     return f"{speaker}: {text}" if speaker else text
 
 
-def chunk_cues(cues: Sequence[Mapping[str, Any]], target_words: int = 220) -> List[Dict[str, Any]]:
+def chunk_cues(cues: Sequence[Mapping[str, Any]], target_words: int = 160) -> List[Dict[str, Any]]:
     chunks: List[Dict[str, Any]] = []
     current: List[Mapping[str, Any]] = []
     words = 0
@@ -735,8 +735,8 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--obligation", action="append")
     compile_parser.add_argument("--query", action="append")
     compile_parser.add_argument("--premise", action="append")
-    compile_parser.add_argument("--candidate-limit", type=int, default=24)
-    compile_parser.add_argument("--max-evidence", type=int, default=10)
+    compile_parser.add_argument("--candidate-limit", type=int, default=16)
+    compile_parser.add_argument("--max-evidence", type=int, default=6)
     compile_parser.add_argument("--typesafe-model", default=DEFAULT_TYPESAFE_MODEL)
     compile_parser.add_argument("--json", action="store_true")
     compile_parser.set_defaults(func=command_compile)
