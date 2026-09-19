@@ -1,9 +1,6 @@
 ---
 name: evidence-chat
 description: Answers questions across timestamped podcast transcripts and large markdown/text documents using Jev-selected evidence with episode-and-time or section-and-line citations. Use for podcast Q&A, cross-episode synthesis, quote finding, earnings reports, filings, manuals, and cited research guides.
-context: fork
-model: haiku
-background: false
 argument-hint: "<question>"
 ---
 
@@ -19,7 +16,7 @@ Return a compact evidence packet to the calling agent. Do not write the final an
    run:
 
    ```bash
-   python "${CLAUDE_SKILL_DIR}/scripts/evidence.py" index \
+   python "${SKILL_DIR}/scripts/evidence.py" index \
      --manifest evidence-library.json --out .evidence-chat/library.json
    ```
 
@@ -32,7 +29,7 @@ Return a compact evidence packet to the calling agent. Do not write the final an
    useful, `--premise` arguments:
 
    ```bash
-   python "${CLAUDE_SKILL_DIR}/scripts/evidence.py" compile \
+   python "${SKILL_DIR}/scripts/evidence.py" compile \
      --library .evidence-chat/library.json --question "..." \
      --obligation "..." --query "..."
    ```
