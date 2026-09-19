@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Index podcast transcripts and compile cited evidence packets with Jev."""
+"""Index transcripts and large documents, then compile cited evidence packets with Jev."""
 
 from __future__ import annotations
 
@@ -39,10 +39,16 @@ RANGE_TIME_RE = re.compile(
     r"(?P<end>\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?)"
 )
 TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?")
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
+MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown"}
 
 
-class PodcastChatError(RuntimeError):
+class EvidenceChatError(RuntimeError):
     pass
+
+
+# Backwards-compatible alias for the pre-rename error name.
+PodcastChatError = EvidenceChatError
 
 
 def eprint(*args: Any) -> None:
@@ -52,7 +58,7 @@ def eprint(*args: Any) -> None:
 def require_typesafe_key() -> str:
     value = os.getenv("TYPESAFE_API_KEY", "").strip()
     if not value:
-        raise PodcastChatError("TYPESAFE_API_KEY is not set")
+        raise EvidenceChatError("TYPESAFE_API_KEY is not set")
     return value
 
 
@@ -68,7 +74,7 @@ def post_typesafe(payload: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
             headers={
                 "Authorization": f"Bearer {require_typesafe_key()}",
                 "Content-Type": "application/json",
-                "User-Agent": "podcast-chat-skill/0.1",
+                "User-Agent": "evidence-chat-skill/0.1",
             },
         )
         try:
@@ -76,7 +82,7 @@ def post_typesafe(payload: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
                 parsed = json.loads(response.read().decode("utf-8"))
                 answers = parsed.get("answers")
                 if not isinstance(answers, dict):
-                    raise PodcastChatError("TypeSafe response is missing answers")
+                    raise EvidenceChatError("TypeSafe response is missing answers")
                 usage = parsed.get("usage", {})
                 return answers, {
                     "input_tokens": int(usage.get("input_tokens", 0) or 0),
@@ -85,10 +91,10 @@ def post_typesafe(payload: Mapping[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:800]
             if exc.code not in retryable or attempt == 3:
-                raise PodcastChatError(f"TypeSafe HTTP {exc.code}: {detail}") from exc
+                raise EvidenceChatError(f"TypeSafe HTTP {exc.code}: {detail}") from exc
         except (URLError, TimeoutError) as exc:
             if attempt == 3:
-                raise PodcastChatError(f"TypeSafe request failed: {exc}") from exc
+                raise EvidenceChatError(f"TypeSafe request failed: {exc}") from exc
         time.sleep(delay)
         delay *= 2
     raise AssertionError("retry loop exited unexpectedly")
@@ -126,7 +132,7 @@ def split_speaker(text: str) -> Tuple[str, str]:
     return "", text.strip()
 
 
-def parse_timestamped_transcript(text: str) -> List[Dict[str, Any]]:
+def parse_timestamped_source(text: str) -> List[Dict[str, Any]]:
     cues: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
 
@@ -183,18 +189,95 @@ def parse_timestamped_transcript(text: str) -> List[Dict[str, Any]]:
     return cues
 
 
+def parse_markdown_document(text: str) -> List[Dict[str, Any]]:
+    """Split a markdown/text document into section-aware blocks with line numbers."""
+    section_stack: List[Tuple[int, str]] = []
+    cues: List[Dict[str, Any]] = []
+    block_lines: List[str] = []
+    block_start = 0
+
+    def current_section() -> str:
+        return " / ".join(title for _, title in section_stack)
+
+    def flush(end_line: int) -> None:
+        nonlocal block_lines, block_start
+        body = normalize_space(" ".join(block_lines))
+        if body:
+            cues.append(
+                {
+                    "start": None,
+                    "end": None,
+                    "speaker": "",
+                    "section": current_section(),
+                    "line_start": block_start,
+                    "line_end": end_line,
+                    "text": body,
+                }
+            )
+        block_lines = []
+
+    lines = text.replace("\ufeff", "").splitlines()
+    for lineno, raw_line in enumerate(lines, start=1):
+        stripped = raw_line.strip()
+        heading = HEADING_RE.match(stripped)
+        if heading:
+            flush(lineno - 1)
+            level = len(heading.group(1))
+            title = normalize_space(heading.group(2))
+            while section_stack and section_stack[-1][0] >= level:
+                section_stack.pop()
+            section_stack.append((level, title))
+            block_start = lineno + 1
+            continue
+        if not stripped:
+            flush(lineno - 1)
+            block_start = lineno + 1
+            continue
+        if not block_lines:
+            block_start = lineno
+        block_lines.append(stripped)
+    flush(len(lines))
+    return [cue for cue in cues if cue["text"]]
+
+
 def untimestamped_cues(text: str) -> List[Dict[str, Any]]:
     paragraphs = [normalize_space(part) for part in re.split(r"\n\s*\n", text) if part.strip()]
-    return [
-        {"start": None, "end": None, "speaker": "", "text": paragraph}
-        for paragraph in paragraphs
-    ]
+    cues: List[Dict[str, Any]] = []
+    cursor = 1
+    for paragraph in paragraphs:
+        # Best-effort line span so plain-text sources still get locators.
+        cues.append(
+            {
+                "start": None,
+                "end": None,
+                "speaker": "",
+                "section": "",
+                "line_start": cursor,
+                "line_end": cursor,
+                "text": paragraph,
+            }
+        )
+        cursor += paragraph.count("\n") + 2
+    return cues
 
 
-def parse_transcript(path: Path) -> Tuple[List[Dict[str, Any]], bool]:
+def parse_source(path: Path) -> Tuple[List[Dict[str, Any]], bool]:
     text = path.read_text(encoding="utf-8", errors="replace")
-    cues = parse_timestamped_transcript(text)
-    return (cues, True) if cues else (untimestamped_cues(text), False)
+    cues = parse_timestamped_source(text)
+    if cues:
+        for cue in cues:
+            cue.setdefault("section", "")
+            cue.setdefault("line_start", None)
+            cue.setdefault("line_end", None)
+        return cues, True
+    if path.suffix.lower() in MARKDOWN_EXTENSIONS or HEADING_RE.search(text):
+        return parse_markdown_document(text), False
+    return untimestamped_cues(text), False
+
+
+# Backwards-compatible aliases for the pre-rename function names.
+parse_transcript = parse_source
+parse_timestamped_transcript = parse_timestamped_source
 
 
 def cue_text(cue: Mapping[str, Any]) -> str:
@@ -210,11 +293,40 @@ def chunk_cues(cues: Sequence[Mapping[str, Any]], target_words: int = 160) -> Li
 
     def emit(items: Sequence[Mapping[str, Any]]) -> None:
         if items:
+            section_label = ""
+            for item in items:
+                section = str(item.get("section", "") or "").strip()
+                body_len = len(str(item.get("text", "")))
+                if section and body_len > 40:
+                    section_label = section
+                    break
+            if not section_label:
+                for item in items:
+                    section = str(item.get("section", "") or "").strip()
+                    if section:
+                        section_label = section
+                        break
+            line_starts = [
+                item.get("line_start")
+                for item in items
+                if isinstance(item.get("line_start"), int)
+            ]
+            line_ends = [
+                item.get("line_end")
+                for item in items
+                if isinstance(item.get("line_end"), int)
+            ]
+            body = "\n".join(cue_text(item) for item in items)
+            if section_label:
+                body = f"[{section_label}] {body}"
             chunks.append(
                 {
                     "start": items[0].get("start"),
                     "end": items[-1].get("end"),
-                    "text": "\n".join(cue_text(item) for item in items),
+                    "section": section_label,
+                    "line_start": min(line_starts) if line_starts else None,
+                    "line_end": max(line_ends) if line_ends else None,
+                    "text": body,
                 }
             )
 
@@ -241,24 +353,37 @@ def tokenize(text: str) -> List[str]:
 
 def load_manifest(path: Path) -> List[Dict[str, Any]]:
     parsed = json.loads(path.read_text(encoding="utf-8"))
-    episodes = parsed.get("episodes") if isinstance(parsed, dict) else None
-    if not isinstance(episodes, list) or not episodes:
-        raise PodcastChatError("Manifest must contain a non-empty episodes array")
+    entries: List[Any] = []
+    if isinstance(parsed, dict):
+        for key in ("episodes", "documents", "sources"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                entries.extend(value)
+    if not entries:
+        raise EvidenceChatError(
+            "Manifest must contain a non-empty episodes, documents, or sources array"
+        )
     base = path.resolve().parent
     result: List[Dict[str, Any]] = []
     seen = set()
-    for raw in episodes:
-        if not isinstance(raw, dict) or not raw.get("title") or not raw.get("transcript"):
-            raise PodcastChatError("Every episode needs title and transcript fields")
+    for raw in entries:
+        if not isinstance(raw, dict) or not raw.get("title"):
+            raise EvidenceChatError("Every entry needs a title field")
+        source_file = raw.get("transcript", raw.get("file", raw.get("path")))
+        if not source_file:
+            raise EvidenceChatError(
+                "Every entry needs a transcript/file/path field pointing to "
+                ".txt, .srt, .vtt, or .md"
+            )
         episode = dict(raw)
         episode["id"] = str(episode.get("id") or slug(str(episode["title"])))
         if episode["id"] in seen:
-            raise PodcastChatError(f"Duplicate episode id: {episode['id']}")
+            raise EvidenceChatError(f"Duplicate entry id: {episode['id']}")
         seen.add(episode["id"])
-        transcript = Path(str(episode["transcript"]))
+        transcript = Path(str(source_file))
         episode["transcript_path"] = transcript if transcript.is_absolute() else base / transcript
         if not episode["transcript_path"].is_file():
-            raise PodcastChatError(f"Transcript not found: {episode['transcript_path']}")
+            raise EvidenceChatError(f"Source file not found: {episode['transcript_path']}")
         result.append(episode)
     return result
 
@@ -266,9 +391,9 @@ def load_manifest(path: Path) -> List[Dict[str, Any]]:
 def load_library(path: Path) -> Dict[str, Any]:
     parsed = json.loads(path.read_text(encoding="utf-8"))
     if parsed.get("version") != LIBRARY_VERSION:
-        raise PodcastChatError("Unsupported library version; rebuild the index")
+        raise EvidenceChatError("Unsupported library version; rebuild the index")
     if not parsed.get("segments"):
-        raise PodcastChatError("Library has no transcript segments")
+        raise EvidenceChatError("Library has no source segments")
     return parsed
 
 
@@ -332,11 +457,11 @@ def evidence_questions(candidate_count: int, obligation_count: int) -> Dict[str,
             questions[f"support_{candidate_index}_{obligation_index}"] = {
                 "type": "noul",
                 "instructions": (
-                    f"Does {ref} contain concrete transcript evidence that materially establishes "
+                    f"Does {ref} contain concrete source evidence that materially establishes "
                     f"`obligations[{obligation_index}]`, rather than merely sharing its topic?"
                 ),
                 "criteria": {
-                    "true": "The speaker's words directly establish or substantially explain the obligation.",
+                    "true": "The source's words directly establish or substantially explain the obligation.",
                     "false": "The passage is irrelevant, topical-only, or too weak to establish the obligation.",
                 },
             }
@@ -355,7 +480,7 @@ def evidence_questions(candidate_count: int, obligation_count: int) -> Dict[str,
             "type": "noul",
             "instructions": f"Does {ref} directly contradict a factual assumption in `premises`?",
             "criteria": {
-                "true": "The transcript provides affirmative evidence that a premise is false or materially qualified.",
+                "true": "The source provides affirmative evidence that a premise is false or materially qualified.",
                 "false": "No direct contradiction; missing information alone is not a contradiction.",
             },
         }
@@ -387,9 +512,10 @@ def judge_candidates(
                 "candidates": [
                     {
                         "id": candidate["id"],
-                        "episode": candidate["episode_title"],
-                        "timestamp": format_timestamp(candidate.get("start")),
-                        "transcript": candidate["text"],
+                        "source": candidate["episode_title"],
+                        "locator": locator(candidate),
+                        "section": str(candidate.get("section", "") or ""),
+                        "passage": candidate["text"],
                     }
                     for candidate in candidates
                 ],
@@ -491,9 +617,10 @@ def packet_status(
                     {
                         "id": row["id"],
                         "role": row["role"],
-                        "episode": row["episode_title"],
-                        "timestamp": format_timestamp(row.get("start")),
-                        "transcript": row["text"],
+                        "source": row["episode_title"],
+                        "locator": locator(row),
+                        "section": str(row.get("section", "") or ""),
+                        "passage": row["text"],
                     }
                     for row in selected
                 ],
@@ -529,9 +656,40 @@ def timestamp_url(source_url: str, seconds: Optional[float]) -> str:
     return urlunparse(parsed._replace(query=urlencode(query)))
 
 
+def locator(row: Mapping[str, Any]) -> str:
+    """Human-readable position: timestamp for audio, section+lines for documents."""
+    start = row.get("start")
+    if isinstance(start, (int, float)):
+        return format_timestamp(start)
+    section = str(row.get("section", "") or "").strip()
+    line_start = row.get("line_start")
+    line_end = row.get("line_end")
+    if isinstance(line_start, int) and isinstance(line_end, int):
+        span = f"L{line_start}-{line_end}" if line_end != line_start else f"L{line_start}"
+        return f"{section} ({span})" if section else span
+    if section:
+        return section
+    return "no locator"
+
+
 def citation(row: Mapping[str, Any]) -> str:
-    label = f"{row['episode_title']} @{format_timestamp(row.get('start'))}"
-    link = timestamp_url(str(row.get("source_url", "")), row.get("start"))
+    title = str(row.get("episode_title", "source"))
+    start = row.get("start")
+    if isinstance(start, (int, float)):
+        label = f"{title} @{format_timestamp(start)}"
+        link = timestamp_url(str(row.get("source_url", "")), start)
+        return f"[{label}]({link})" if link else f"[{label}]"
+    section = str(row.get("section", "") or "").strip()
+    line_start = row.get("line_start")
+    line_end = row.get("line_end")
+    if isinstance(line_start, int) and isinstance(line_end, int):
+        span = f"L{line_start}-{line_end}" if line_end != line_start else f"L{line_start}"
+        label = f"{title} § {section} ({span})" if section else f"{title} ({span})"
+    elif section:
+        label = f"{title} § {section}"
+    else:
+        label = title
+    link = str(row.get("source_url", "") or "")
     return f"[{label}]({link})" if link else f"[{label}]"
 
 
@@ -573,18 +731,20 @@ def packet_markdown(
 
 
 def command_inspect(args: argparse.Namespace) -> int:
-    path = Path(args.transcript)
-    cues, timestamped = parse_transcript(path)
+    source = getattr(args, "transcript", None) or getattr(args, "file", None)
+    if not source:
+        raise EvidenceChatError("Provide --transcript <path> (or --file <path>)")
+    path = Path(source)
+    cues, timestamped = parse_source(path)
     chunks = chunk_cues(cues)
-    print(f"Transcript: {path}")
+    sections = sorted({str(cue.get("section", "")) for cue in cues if cue.get("section")})
+    print(f"Source: {path}")
     print(f"Timestamped: {'yes' if timestamped else 'no'}")
+    print(f"Sections: {len(sections)}")
     print(f"Cues: {len(cues)}")
     print(f"Chunks: {len(chunks)}")
     if chunks:
-        print(
-            f"First chunk: {format_timestamp(chunks[0].get('start'))} — "
-            f"{chunks[0]['text'][:240]}"
-        )
+        print(f"First chunk: {locator(chunks[0])} — {chunks[0]['text'][:240]}")
     return 0
 
 
@@ -594,9 +754,11 @@ def command_index(args: argparse.Namespace) -> int:
     segments: List[Dict[str, Any]] = []
     untimestamped: List[str] = []
     for episode in episodes:
-        cues, timestamped = parse_transcript(Path(episode["transcript_path"]))
+        cues, timestamped = parse_source(Path(episode["transcript_path"]))
         if not timestamped:
-            untimestamped.append(str(episode["title"]))
+            has_sections = any(cue.get("section") for cue in cues)
+            if not has_sections:
+                untimestamped.append(str(episode["title"]))
         for index, chunk in enumerate(chunk_cues(cues)):
             segments.append(
                 {
@@ -608,7 +770,7 @@ def command_index(args: argparse.Namespace) -> int:
                 }
             )
     if not segments:
-        raise PodcastChatError("No transcript content was found")
+        raise EvidenceChatError("No source content was found")
     output = {
         "version": LIBRARY_VERSION,
         "created_at": int(time.time()),
@@ -628,10 +790,10 @@ def command_index(args: argparse.Namespace) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(output, ensure_ascii=False), encoding="utf-8")
     print(
-        f"Indexed {len(episodes)} episodes and {len(segments)} chunks locally → {out_path}"
+        f"Indexed {len(episodes)} sources and {len(segments)} chunks locally → {out_path}"
     )
     if untimestamped:
-        print("Warning: no timestamps found for: " + ", ".join(untimestamped))
+        print("Warning: no timestamps or sections found for: " + ", ".join(untimestamped))
     return 0
 
 
@@ -641,8 +803,8 @@ def command_compile(args: argparse.Namespace) -> int:
     queries = args.query or [args.question, *obligations]
     candidates = retrieve_candidates(library, queries, args.candidate_limit)
     if not candidates:
-        raise PodcastChatError(
-            "Local search found no candidates; add queries using likely transcript wording"
+        raise EvidenceChatError(
+            "Local search found no candidates; add queries using likely source wording"
         )
     eprint(f"Local search found {len(candidates)} candidates; judging with Jev...")
     judged, judge_usage = judge_candidates(
@@ -682,6 +844,8 @@ def command_compile(args: argparse.Namespace) -> int:
                         {
                             "id": row["id"],
                             "citation": citation(row),
+                            "locator": locator(row),
+                            "section": str(row.get("section", "") or ""),
                             "role": row["role"],
                             "role_probability": row["role_probability"],
                             "supports": row["supports"],
@@ -710,18 +874,29 @@ def command_compile(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compile cited podcast evidence packets with local search and Jev."
+        description="Compile cited evidence packets from transcripts and large documents with local search and Jev."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     inspect_parser = subparsers.add_parser(
-        "inspect", help="Check transcript parsing without API calls"
+        "inspect", help="Check source parsing without API calls"
     )
-    inspect_parser.add_argument("--transcript", required=True)
+    inspect_parser.add_argument(
+        "--transcript",
+        required=False,
+        default=None,
+        help="Transcript or document path (.txt, .srt, .vtt, .md)",
+    )
+    inspect_parser.add_argument(
+        "--file",
+        required=False,
+        default=None,
+        help="Alias for --transcript",
+    )
     inspect_parser.set_defaults(func=command_inspect)
 
     index_parser = subparsers.add_parser(
-        "index", help="Build a local reusable transcript index"
+        "index", help="Build a local reusable source index"
     )
     index_parser.add_argument("--manifest", required=True)
     index_parser.add_argument("--out", required=True)
@@ -752,7 +927,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--max-evidence must be positive")
     try:
         return int(args.func(args))
-    except (PodcastChatError, OSError, ValueError, json.JSONDecodeError) as exc:
+    except (EvidenceChatError, OSError, ValueError, json.JSONDecodeError) as exc:
         eprint(f"error: {exc}")
         return 2
 
