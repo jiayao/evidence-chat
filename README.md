@@ -40,14 +40,6 @@ python scripts/evidence.py compile \
 
 See `SKILL.md` for full usage and `references/manifest.md` for manifest format.
 
-## Migrating from podcast-chat
-
-Renamed in place: `scripts/podcast_evidence.py` → `scripts/evidence.py`,
-libraries live under `.evidence-chat/` by convention. Old manifests
-(`episodes` + `transcript` keys), old library files, `--transcript`, and the
-`PodcastChatError` / `parse_transcript` names keep working, so just swap the
-script path in existing commands.
-
 ## License
 
 MIT – see `LICENSE`.

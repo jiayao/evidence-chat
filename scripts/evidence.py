@@ -47,10 +47,6 @@ class EvidenceChatError(RuntimeError):
     pass
 
 
-# Backwards-compatible alias for the pre-rename error name.
-PodcastChatError = EvidenceChatError
-
-
 def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
@@ -273,11 +269,6 @@ def parse_source(path: Path) -> Tuple[List[Dict[str, Any]], bool]:
     if path.suffix.lower() in MARKDOWN_EXTENSIONS or HEADING_RE.search(text):
         return parse_markdown_document(text), False
     return untimestamped_cues(text), False
-
-
-# Backwards-compatible aliases for the pre-rename function names.
-parse_transcript = parse_source
-parse_timestamped_transcript = parse_timestamped_source
 
 
 def cue_text(cue: Mapping[str, Any]) -> str:

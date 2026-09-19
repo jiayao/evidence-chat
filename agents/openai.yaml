@@ -1,7 +1,0 @@
-interface:
-  display_name: "Evidence Chat"
-  short_description: "Ask podcasts and large documents questions with cited evidence"
-  default_prompt: "Use $evidence-chat to answer my podcast or document question with evidence from the sources and timestamped or section-and-line citations."
-
-policy:
-  allow_implicit_invocation: true
